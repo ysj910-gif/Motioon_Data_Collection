@@ -21,3 +21,30 @@ class PlatformManager:
             if p['x_start'] <= char_x <= p['x_end'] and abs(char_y - p['y']) < 10:
                 return p
         return None
+    
+    def get_distances(self, char_x, char_y):
+        distances = {'up': None, 'down': None, 'left': None, 'right': None}
+    
+        for p in self.platforms:
+        # 1. 상하 거리 (캐릭터의 X 좌표가 발판 범위 내에 있을 때)
+            if p['x_start'] <= char_x <= p['x_end']:
+                diff_y = p['y'] - char_y
+                if diff_y > 0: # 아래쪽 발판
+                    if distances['down'] is None or diff_y < distances['down']:
+                        distances['down'] = diff_y
+                elif diff_y < 0: # 위쪽 발판
+                    if distances['up'] is None or abs(diff_y) < distances['up']:
+                        distances['up'] = abs(diff_y)
+        
+        # 2. 좌우 거리 (캐릭터와 발판의 Y 좌표가 비슷할 때, 오차 15px 허용)
+            if abs(p['y'] - char_y) < 15:
+                if p['x_end'] < char_x: # 왼쪽 발판
+                    diff_x = char_x - p['x_end']
+                    if distances['left'] is None or diff_x < distances['left']:
+                        distances['left'] = diff_x
+                elif p['x_start'] > char_x: # 오른쪽 발판
+                    diff_x = p['x_start'] - char_x
+                    if distances['right'] is None or diff_x < distances['right']:
+                        distances['right'] = diff_x
+
+        return distances
