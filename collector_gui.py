@@ -21,6 +21,32 @@ import config
 from vision_engine import VisionEngine
 from platform_manager import PlatformManager
 
+from ctypes import wintypes
+
+user32 = ctypes.windll.user32
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG)]
+
+def get_client_area_on_screen(hwnd):
+    """
+    returns (client_left, client_top, client_width, client_height) in SCREEN coords
+    """
+    rect = RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        raise ctypes.WinError()
+
+    pt = wintypes.POINT(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+        raise ctypes.WinError()
+
+    w = rect.right - rect.left
+    h = rect.bottom - rect.top
+    return pt.x, pt.y, w, h
+
 class DataCollectorApp:
     def __init__(self, root):
         self.root = root
@@ -149,17 +175,24 @@ class DataCollectorApp:
             # 제목 표시줄 제외를 위해 창 좌표 획득 (대략적 수정 필요시 offset 조절)
             # win.left, win.top은 제목 표시줄을 포함한 창 전체의 좌상단입니다.
             with mss.mss() as sct:
-                monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
+                hwnd = win._hWnd
+                c_left, c_top, c_w, c_h = get_client_area_on_screen(hwnd)
+
+                monitor = {"top": c_top, "left": c_left, "width": c_w, "height": c_h}
                 img = np.array(sct.grab(monitor))
                 img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                
-                # ROI 선택 (창 기준 상대 좌표 반환)
+
                 roi = cv2.selectROI("Select Minimap ROI", img_bgr, False)
                 cv2.destroyWindow("Select Minimap ROI")
-                
+
                 if roi != (0, 0, 0, 0):
-                    config.MINIMAP_ROI = {'left': int(roi[0]), 'top': int(roi[1]), 'width': int(roi[2]), 'height': int(roi[3])}
-                    self.record_btn.config(state="normal")
+                # ROI는 이제 "클라이언트(게임 화면)" 기준 좌표가 됨
+                    config.MINIMAP_ROI = {
+                        'left': int(roi[0]),
+                        'top': int(roi[1]),
+                        'width': int(roi[2]),
+                        'height': int(roi[3])
+                    }
                     messagebox.showinfo("완료", "미니맵 영역 설정이 완료되었습니다.")
         except Exception as e:
             messagebox.showerror("오류", str(e))
@@ -212,8 +245,8 @@ class DataCollectorApp:
                     # 1. 메이플 창 위치 및 캡처 영역 계산
                     win = gw.getWindowsWithTitle('MapleStory')[0]
                     capture_roi = {
-                        "top": win.top + config.MINIMAP_ROI['top'],
-                        "left": win.left + config.MINIMAP_ROI['left'],
+                        "top": c_top + config.MINIMAP_ROI['top'],
+                        "left": c_left + config.MINIMAP_ROI['left'],
                         "width": config.MINIMAP_ROI['width'],
                         "height": config.MINIMAP_ROI['height']
                     }
@@ -222,7 +255,7 @@ class DataCollectorApp:
                     mini_img = np.array(sct.grab(capture_roi))
                     mini_bgr = cv2.cvtColor(mini_img, cv2.COLOR_BGRA2BGR)
                     
-                    # 3. 캐릭터 기본 탐지 (원본 좌표)
+                    # 3. 캐릭터 기본 탐지 (원본 좌표 raw_x, raw_y)
                     mask = self.vision.get_character_mask(mini_bgr)
                     M = cv2.moments(mask)
                     if M["m00"] != 0:
@@ -231,41 +264,47 @@ class DataCollectorApp:
                     else:
                         raw_x, raw_y = 0, 0
 
-                    # 4. [보정치 적용] 사용자가 GUI에서 조절한 오차 반영
-                    # 이 좌표가 발판 데이터와 매칭되는 최종 좌표입니다.
-                    roi_x = raw_x + self.offset_x.get()
-                    roi_y = raw_y + self.offset_y.get()
+                    # 4. [보정치 가져오기]
+                    # offset_x, y는 "발판을 얼마나 이동시켜서 그릴지"를 결정합니다.
+                    off_x = self.offset_x.get()
+                    off_y = self.offset_y.get()
 
                 except Exception as e:
                     print(f"캡처/탐지 중 오류: {e}")
                     continue
 
-                # 5. 발판 판정 및 거리 계산 (보정된 roi_x, roi_y 사용)
-                # PlatformManager를 통해 현재 캐릭터 아래의 발판 정보를 가져옵니다.
-                current_plat = self.plat_mgr.get_current_platform(roi_x, roi_y)
-                # KeyError를 방지하기 위해 .get('id', -1) 형식을 사용합니다.
+                # 5. 발판 판정 및 거리 계산
+                # 시각적으로는 발판을 (off_x, off_y)만큼 이동시켰으므로,
+                # 논리적으로는 캐릭터 위치에서 offset을 빼야 원본 JSON 좌표계와 매칭됩니다.
+                # 예: 화면상 발판이 Y=130에 있고(원본 100 + 오프셋 30), 캐릭터가 130에 있다면
+                #     캐릭터(130) - 오프셋(30) = 100 -> JSON의 100과 일치함.
+                calc_x = raw_x - off_x
+                calc_y = raw_y - off_y
+                
+                current_plat = self.plat_mgr.get_current_platform(calc_x, calc_y)
                 plat_id = current_plat.get('id', -1) if current_plat else -1
                 
                 # 6. 디버그 시각화 (이미지 위에 정보 덮어쓰기)
                 debug_img = mini_bgr.copy()
 
-                # (1) JSON에 저장된 모든 발판 그리기 (하늘색 선)
+                # (1) JSON 발판 그리기 (오프셋 적용하여 시각화)
                 platforms = getattr(self.plat_mgr, 'platforms', [])
                 for p in platforms:
-                    cv2.line(debug_img, (int(p['x_start']), int(p['y'])), 
-                             (int(p['x_end']), int(p['y'])), (255, 255, 0), 1)
+                    # 발판 선을 offset만큼 이동시켜서 그립니다 (사용자가 맞추기 편하도록)
+                    cv2.line(debug_img, 
+                             (int(p['x_start'] + off_x), int(p['y'] + off_y)), 
+                             (int(p['x_end'] + off_x), int(p['y'] + off_y)), 
+                             (255, 255, 0), 1)
 
                 # (2) 캐릭터 위치 표시
                 if raw_x > 0:
-                    # 원본 인식 위치 (작은 회색 점)
-                    cv2.circle(debug_img, (raw_x, raw_y), 2, (128, 128, 128), -1)
-                    
-                    # 보정된 최종 위치 (발판 위면 초록색, 아니면 빨간색)
+                    # 인식된 실제 캐릭터 위치 (빨간색/초록색 점)
+                    # 여기는 raw 좌표 그대로 찍어서 "실제 이미지상 위치"를 보여줍니다.
                     color = (0, 255, 0) if plat_id != -1 else (0, 0, 255)
-                    cv2.circle(debug_img, (roi_x, roi_y), 4, color, -1)
+                    cv2.circle(debug_img, (raw_x, raw_y), 4, color, -1)
                     
-                    # 상단에 정보 텍스트 표시
-                    info_text = f"ID: {plat_id} | Pos: {roi_x},{roi_y} (Raw:{raw_x},{raw_y})"
+                    # 상단 정보 텍스트
+                    info_text = f"ID: {plat_id} | RawPos: {raw_x},{raw_y} | Offset: {off_x},{off_y}"
                     cv2.putText(debug_img, info_text, (5, 15), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
@@ -273,7 +312,7 @@ class DataCollectorApp:
                 cv2.imshow("Detection Debug", debug_img)
                 cv2.waitKey(1)
 
-                # 7. 데이터 저장 (보정된 좌표와 이미지 저장)
+                # 7. 데이터 저장
                 img_name = f"{config.JOB}_{int(time.time()*1000)}.jpg"
                 cv2.imwrite(os.path.join(config.DATA_DIR, "images", img_name), mini_bgr)
                 
@@ -281,8 +320,9 @@ class DataCollectorApp:
                     'timestamp': elapsed, 
                     'job': config.JOB, 
                     'image_path': img_name,
-                    'char_x': roi_x, # 보정된 좌표 저장
-                    'char_y': roi_y, 
+                    # 학습 데이터에는 JSON 기준 좌표(보정된 좌표)를 저장합니다.
+                    'char_x': calc_x, 
+                    'char_y': calc_y, 
                     'platform_id': plat_id,
                     'actions': " ".join(list(self.current_actions)) if self.current_actions else "idle"
                 })
@@ -303,6 +343,7 @@ class DataCollectorApp:
         
         # 녹화 종료 시 창 닫기
         cv2.destroyAllWindows()
+
 
     def stop_recording(self):
         self.is_recording = False
