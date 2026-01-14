@@ -1,3 +1,6 @@
+import tkinter as tk
+from collector_gui import DataCollectorApp
+
 # main.py의 __init__ 부분을 다음과 같이 수정하세요
 def __init__(self):
     self.root = tk.Tk()
@@ -26,3 +29,8 @@ def __init__(self):
     
     if self.load_initial_image():
         self.run_main_loop()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DataCollectorApp(root)
+    root.mainloop()
